@@ -1,0 +1,13 @@
+{
+  "$schema": "https://glama.ai/mcp/schemas/server.json",
+  "maintainers": ["walkojas-boop"],
+  "categories": ["developer-tools", "data-processing", "json"],
+  "description": "Deterministic JSON repair, validation, example-generation, and schema-coercion for AI agents. Zero LLM calls. Sub-10ms. $0.0005 per call.",
+  "endpoint": "https://jsonshelf.vercel.app/mcp",
+  "manifest": "https://jsonshelf.vercel.app/.well-known/mcp.json",
+  "ai_plugin": "https://jsonshelf.vercel.app/.well-known/ai-plugin.json",
+  "openapi": "https://jsonshelf.vercel.app/openapi.json",
+  "llms_txt": "https://jsonshelf.vercel.app/llms.txt",
+  "pricing": "https://jsonshelf.vercel.app/v1/pricing",
+  "tags": ["json", "schema", "validation", "repair", "agents"]
+}
