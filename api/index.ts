@@ -3,8 +3,20 @@ import { handle } from 'hono/vercel';
 import { cors } from 'hono/cors';
 import { jsonrepair } from 'jsonrepair';
 import { Validator } from '@cfworker/json-schema';
+import Stripe from 'stripe';
 
 export const config = { runtime: 'edge' };
+
+// ---------- payments config ----------
+const PLATFORM_WALLET = '0x8ABCE477e22B76121f04c6c6a69eE2e6a12De53e'; // USDC on Base
+const BASE_RPC = 'https://base.llamarpc.com';
+const USDC_BASE = '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913'; // USDC on Base mainnet
+
+function stripeClient() {
+  const key = (globalThis as any).process?.env?.STRIPE_SECRET_KEY || '';
+  if (!key) throw new Error('STRIPE_SECRET_KEY not set');
+  return new Stripe(key, { httpClient: Stripe.createFetchHttpClient(), apiVersion: '2024-12-18.acacia' } as any);
+}
 
 // Web Crypto helpers (edge runtime has no node:crypto)
 function randomHex(bytes: number): string {
@@ -30,7 +42,7 @@ const CREDIT_PACKS = [
 const RATE_LIMIT_PER_MINUTE = 120;
 
 // ---------- in-memory stores (module-scope persists across warm invocations) ----------
-type KeyRow = { key: string; credits: number; created_at: number; calls: number };
+type KeyRow = { key: string; credits: number; created_at: number; calls: number; credited_sessions?: string[]; credited_tx?: string[] };
 const KEYS = new Map<string, KeyRow>();
 const INTENTS = new Map<string, { key: string; credits: number; price_usd: number; paid: boolean }>();
 const RATE = new Map<string, { count: number; reset_at: number }>();
@@ -572,46 +584,159 @@ app.get('/v1/keys/self', (c) => {
   });
 });
 
-// ---------- credits purchase ----------
+// ---------- credits purchase (LIVE: Stripe Checkout + x402 USDC) ----------
 app.post('/v1/credits', async (c) => {
   const body = await c.req.json().catch(() => ({} as any));
   const packId = body.pack || 'starter';
   const pack = CREDIT_PACKS.find(p => p.id === packId);
-  if (!pack) { const e = err('unknown_pack'); return c.json(e, 400); }
+  if (!pack) return c.json(err('unknown_pack'), 400);
   const row = authKey(c.req.raw.headers);
-  if (!row) { const e = err('missing_auth'); return c.json(e, 401); }
-  const intent = newIntent();
-  INTENTS.set(intent, { key: row.key, credits: pack.credits, price_usd: pack.price_usd, paid: false });
+  if (!row) return c.json(err('missing_auth'), 401);
   const base = `https://${c.req.header('host')}`;
+
+  // Create a real Stripe Checkout Session
+  let session: Stripe.Checkout.Session;
+  try {
+    const stripe = stripeClient();
+    session = await stripe.checkout.sessions.create({
+      mode: 'payment',
+      line_items: [{
+        price_data: {
+          currency: 'usd',
+          unit_amount: Math.round(pack.price_usd * 100),
+          product_data: {
+            name: `jsonshelf ${pack.id} pack`,
+            description: `${pack.credits.toLocaleString()} credits for jsonshelf agent API`,
+          },
+        },
+        quantity: 1,
+      }],
+      success_url: `${base}/v1/credits/success?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${base}/v1/credits/cancel`,
+      metadata: { service: 'jsonshelf', pack: pack.id, credits: String(pack.credits), key_hash: row.key.slice(0, 14) },
+    });
+  } catch (e: any) {
+    return c.json({ error: true, code: 'stripe_error', message: e?.message || 'stripe_failed', fix: 'Retry in 30s; contact support if persists.', http_status: 502 }, 502);
+  }
+
   return c.json({
-    intent,
+    session_id: session.id,
     pack,
-    payment_url: `${base}/v1/credits/complete/${intent}`,
+    payment_url: session.url,  // REAL stripe.com checkout URL
+    verify_instructions: `After payment completes, POST ${base}/v1/credits/verify {"session_id":"${session.id}"} with the SAME Authorization header to credit your key.`,
     x402: {
       version: '0.1',
       scheme: 'exact',
-      network: 'base-sepolia',
+      network: 'base',
       max_amount_required: String(pack.price_usd),
       asset: 'USDC',
-      resource: `${base}/v1/credits/${intent}`,
+      asset_contract: USDC_BASE,
+      resource: `${base}/v1/payments/verify`,
       description: `jsonshelf ${pack.id} pack: ${pack.credits} credits`,
-      pay_to: '0x0000000000000000000000000000000000000000',
+      pay_to: PLATFORM_WALLET,
+      verify_endpoint: `${base}/v1/payments/verify`,
     },
-    expires_in_seconds: 3600,
-    note: 'TEST MODE: GET payment_url immediately credits the account. In production, this URL redirects to Stripe Checkout / Coinbase Commerce / x402 facilitator.',
+    expires_at: session.expires_at,
+    live_mode: true,
   });
 });
 
-app.get('/v1/credits/complete/:intent', (c) => {
-  const intent = c.req.param('intent');
-  const row = INTENTS.get(intent);
-  if (!row) return c.json({ error: true, code: 'invalid_intent', message: 'Unknown intent.', fix: 'POST /v1/credits to get a fresh intent.', http_status: 404 }, 404);
-  if (row.paid) return c.json({ status: 'already_paid', intent });
-  row.paid = true;
-  const key = KEYS.get(row.key);
-  if (key) key.credits += row.credits;
-  return c.json({ status: 'paid', intent, credits_added: row.credits, credits_balance: key?.credits ?? row.credits, test_mode: true });
+// Client-driven Stripe verification: agent completes payment, then calls this
+app.post('/v1/credits/verify', async (c) => {
+  const body = await c.req.json().catch(() => ({} as any));
+  const row = authKey(c.req.raw.headers);
+  if (!row) return c.json(err('missing_auth'), 401);
+  const sessionId = body.session_id;
+  if (!sessionId || typeof sessionId !== 'string') return c.json(err('missing_input', { detail: 'Need {"session_id":"cs_..."}' }), 400);
+  try {
+    const stripe = stripeClient();
+    const session = await stripe.checkout.sessions.retrieve(sessionId);
+    if (session.metadata?.service !== 'jsonshelf') return c.json({ error: true, code: 'wrong_service', message: 'Session belongs to another service.', fix: 'Pass a jsonshelf session_id.', http_status: 400 }, 400);
+    if (session.payment_status !== 'paid') return c.json({ error: true, code: 'not_paid', message: `Stripe reports payment_status=${session.payment_status}`, fix: 'Complete the checkout URL first, then retry verify.', http_status: 402, session_status: session.payment_status }, 402);
+    const credits = parseInt(session.metadata?.credits || '0', 10);
+    if (!credits) return c.json({ error: true, code: 'no_credits_in_metadata', message: 'Session metadata missing credits.', http_status: 500 }, 500);
+    // Idempotency: store "credited_sessions" keyed by session.id, check KEYS row
+    if (!row.credited_sessions) row.credited_sessions = [];
+    if (row.credited_sessions.includes(sessionId)) return c.json({ status: 'already_credited', credits_balance: row.credits });
+    row.credits += credits;
+    row.credited_sessions.push(sessionId);
+    return c.json({
+      status: 'paid',
+      session_id: sessionId,
+      credits_added: credits,
+      credits_balance: row.credits,
+      amount_paid_usd: (session.amount_total || 0) / 100,
+      live_mode: true,
+    });
+  } catch (e: any) {
+    return c.json({ error: true, code: 'stripe_error', message: e?.message || 'unknown', fix: 'Retry; if session_id is valid and paid, this will credit.', http_status: 502 }, 502);
+  }
 });
+
+// Stripe webhook — secondary safety net (noop since verify is client-driven)
+app.post('/stripe/webhook', async (c) => {
+  const sig = c.req.header('stripe-signature') || '';
+  const rawBody = await c.req.text();
+  const secret = (globalThis as any).process?.env?.STRIPE_WEBHOOK_SECRET || '';
+  try {
+    const stripe = stripeClient();
+    await stripe.webhooks.constructEventAsync(rawBody, sig, secret);
+  } catch (e: any) {
+    return c.json({ error: 'invalid signature', detail: e?.message }, 400);
+  }
+  // No-op: credits are applied via client-driven /v1/credits/verify.
+  // The webhook exists so Stripe can deliver events without 404s.
+  return c.json({ received: true, processed_by: 'client_driven_verify' });
+});
+
+// x402 on-chain USDC verification
+app.post('/v1/payments/verify', async (c) => {
+  const body = await c.req.json().catch(() => ({} as any));
+  const row = authKey(c.req.raw.headers);
+  if (!row) return c.json(err('missing_auth'), 401);
+  const txHash = body.tx_hash;
+  if (!txHash || !/^0x[0-9a-fA-F]{64}$/.test(txHash)) return c.json({ error: true, code: 'bad_tx_hash', message: 'tx_hash must be a 0x-prefixed 32-byte hex string.', fix: 'Provide the Base mainnet USDC transfer tx hash.', http_status: 400 }, 400);
+  try {
+    // Fetch the tx receipt from Base RPC
+    const rpcRes = await fetch(BASE_RPC, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', method: 'eth_getTransactionReceipt', params: [txHash], id: 1 }) });
+    const rpc = await rpcRes.json() as any;
+    if (!rpc.result) return c.json({ error: true, code: 'tx_not_found', message: 'Transaction not found on Base mainnet.', fix: 'Wait for confirmation then retry.', http_status: 404 }, 404);
+    const receipt = rpc.result;
+    if (receipt.status !== '0x1') return c.json({ error: true, code: 'tx_failed', message: 'Transaction failed on-chain.', http_status: 400 }, 400);
+    // Find the USDC Transfer log: topic0 = keccak("Transfer(address,address,uint256)")
+    const TRANSFER_TOPIC = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
+    const logs = (receipt.logs || []).filter((l: any) => l.address?.toLowerCase() === USDC_BASE.toLowerCase() && l.topics?.[0] === TRANSFER_TOPIC);
+    if (!logs.length) return c.json({ error: true, code: 'no_usdc_transfer', message: 'Transaction has no USDC Transfer log on Base mainnet.', fix: 'Send USDC to ' + PLATFORM_WALLET + ' on Base then retry with that tx hash.', http_status: 400 }, 400);
+    const toPadded = '0x' + PLATFORM_WALLET.slice(2).toLowerCase().padStart(64, '0');
+    const matching = logs.find((l: any) => l.topics[2]?.toLowerCase() === toPadded);
+    if (!matching) return c.json({ error: true, code: 'wrong_recipient', message: 'USDC transfer was not addressed to our platform wallet.', fix: 'Send to ' + PLATFORM_WALLET + '.', http_status: 400 }, 400);
+    const amountWei = BigInt(matching.data);
+    const amountUsd = Number(amountWei) / 1_000_000; // USDC has 6 decimals
+    // Idempotency
+    if (!row.credited_tx) row.credited_tx = [];
+    if (row.credited_tx.includes(txHash.toLowerCase())) return c.json({ status: 'already_credited', balance_credits: row.credits });
+    // Convert USD to credits ($0.0005 per credit)
+    const creditsToAdd = Math.floor(amountUsd / PRICE_PER_CALL_USD);
+    row.credits += creditsToAdd;
+    row.credited_tx.push(txHash.toLowerCase());
+    return c.json({
+      status: 'paid',
+      tx_hash: txHash,
+      amount_usd: amountUsd,
+      credits_added: creditsToAdd,
+      credits_balance: row.credits,
+      pay_to: PLATFORM_WALLET,
+      network: 'base',
+      live_mode: true,
+    });
+  } catch (e: any) {
+    return c.json({ error: true, code: 'rpc_error', message: e?.message || 'rpc_failed', http_status: 502 }, 502);
+  }
+});
+
+// Stripe redirect landing pages (JSON, still agent-readable)
+app.get('/v1/credits/success', (c) => c.json({ status: 'stripe_redirect', session_id: c.req.query('session_id'), next: 'POST /v1/credits/verify with that session_id and your Authorization header.' }));
+app.get('/v1/credits/cancel', (c) => c.json({ status: 'cancelled', next: 'Retry POST /v1/credits.' }));
 
 // ---------- core tools ----------
 function charge(c: any): { row: KeyRow | null; errResp?: any } {
